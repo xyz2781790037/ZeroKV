@@ -1,0 +1,199 @@
+syntax = "proto3";
+
+package kvcache.controlplane.v1;
+
+option go_package = "./controlplane";
+
+// ControlPlane 只承载集群控制面信息：membership、路由、block 元数据。
+// 大块 KV payload 不走 gRPC/protobuf，继续通过 internal/network 的 P2P 流式 TCP
+// 传输。
+service ControlPlane {
+  // RegisterNode 把一个节点加入集群成员表，通常在 daemon 启动时调用。
+  rpc RegisterNode(RegisterNodeRequest) returns (RegisterNodeResponse);
+
+  // Heartbeat 续约节点存活状态，并返回 coordinator 当前拓扑版本。
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+
+  // LeaveNode 逻辑下线节点，控制面应生成 tombstone 压制旧状态包。
+  rpc LeaveNode(LeaveNodeRequest) returns (LeaveNodeResponse);
+
+  // GetMembership 拉取当前成员表快照，供新节点启动或拓扑缓存刷新使用。
+  rpc GetMembership(GetMembershipRequest) returns (GetMembershipResponse);
+
+  // SyncMembership 向对端推送本地观察到的成员状态，用于 gossip/多 coordinator
+  // 同步。
+  rpc SyncMembership(SyncMembershipRequest) returns (SyncMembershipResponse);
+
+  // RouteBlock 查询 blockID 对应的 primary 和 fallback 节点。
+  rpc RouteBlock(RouteBlockRequest) returns (RouteBlockResponse);
+
+  // AnnounceBlock 上报本节点已经持有某个 block 的元数据。
+  rpc AnnounceBlock(AnnounceBlockRequest) returns (AnnounceBlockResponse);
+
+  // ForgetBlock 上报本节点已经删除某个 block，用于控制面清理位置索引。
+  rpc ForgetBlock(ForgetBlockRequest) returns (ForgetBlockResponse);
+
+  // GetBlockLocations 查询控制面已知的 block 副本位置。
+  rpc GetBlockLocations(GetBlockLocationsRequest)
+      returns (GetBlockLocationsResponse);
+}
+
+enum NodeState {
+  NODE_STATE_UNKNOWN = 0; // 未知状态（默认零值，防止空指针解析）
+  NODE_STATE_ALIVE = 1; // 正常存活，算力可用，可接收读写流量
+  NODE_STATE_SUSPECT = 2; // 疑似宕机（心跳超时，但尚未确诊或走完彻底剔除流程）
+  NODE_STATE_DOWN = 3; // 确诊宕机，算力不可用，需将流量路由至其他副本
+  NODE_STATE_TOMBSTONE =
+      4; // 墓碑状态（已彻底物理/逻辑下线，用于压制网络乱序旧包防复活）
+}
+
+enum StorageTier {
+  STORAGE_TIER_UNKNOWN = 0; // 未知存储层级
+  STORAGE_TIER_MEMORY = 1; // 内存层（访问延迟最低，通常为第一路由优先级）
+  STORAGE_TIER_DISK =
+      2; // 磁盘层（如 NVMe/SSD，容量大但延迟相对较高，作为兜底）
+}
+
+message Node {
+  string id = 1;   // 节点全局唯一标识符（UUID/Snowflake ID）
+  string addr = 2; // 节点的网络可达地址（例如 "192.168.1.100:8080"）
+  NodeState state = 3; // 节点当前的生命周期状态
+  uint64 version =
+      4; // 节点状态单调递增版本号（核心：防并发修改时旧状态覆盖新状态）
+  int64 last_heartbeat_unix_nano =
+      5; // 节点最后一次成功心跳的绝对物理时间戳（纳秒，用于精准计算超时）
+}
+
+message BlockMeta {
+  uint64 block_id = 1; // 数据块的全局唯一 ID
+  uint64 length = 2; // 数据块物理大小的精确字节数（用于客户端拉取时预分配内存）
+  uint32 checksum =
+      3; // 数据块的 CRC32/Murmur3 校验和（核心：防硬件静默损坏 Data Rot）
+  uint64 generation = 4; // 世代号（用于冷热数据置换、多版本控制或垃圾回收标记）
+  uint64 seq = 5; // 序列号（用于同一 block 的修改时序控制）
+}
+
+message BlockLocation {
+  uint64 block_id = 1; // 数据块 ID
+  string node_id = 2;  // 持有该数据块副本的物理节点 ID
+  string addr = 3; // 持有节点的物理网络地址（方便客户端直连拉取数据面）
+  StorageTier tier = 4; // 当前副本存放在内存还是磁盘
+  BlockMeta meta =
+      5; // 该副本底层的客观事实元数据（大小、校验和，不可被网络层篡改）
+  uint64 version =
+      6; // 此位置信息的最后修改版本号（核心：防乱序网络包导致的幽灵复活）
+}
+
+message RegisterNodeRequest {
+  Node node = 1; // 申请加入集群的节点自我描述信息
+}
+
+message RegisterNodeResponse {
+  Node self = 1; // 控制面合并加工后，最终认定的该节点完整状态快照
+  uint64 membership_version = 2; // 注册完成后，推进的全局集群成员表版本号
+  uint64 route_version = 3; // 注册后如果触发了拓扑重计算，返回最新的路由版本号
+}
+
+message HeartbeatRequest {
+  string node_id = 1; // 汇报心跳的节点 ID
+  int64 heartbeat_unix_nano = 2; // 发出心跳时的客户端本地绝对时间戳（纳秒）
+}
+
+message HeartbeatResponse {
+  Node node = 1; // 控制面视角下该节点的最新状态（用于纠正节点自身的脑裂错觉）
+  uint64 membership_version =
+      2; // 当前全局成员表版本号（告知节点是否有其他机器加入/退出）
+  uint64 route_version = 3; // 当前路由表版本号
+}
+
+message LeaveNodeRequest {
+  string node_id = 1; // 申请主动下线的节点 ID
+  string reason =
+      2; // 下线原因（如 "SIGTERM", "MAINTENANCE"，供控制面打日志排查）
+}
+
+message LeaveNodeResponse {
+  Node tombstone = 1; // 控制面为该节点生成的带有最新 version 的墓碑记录快照
+  uint64 membership_version = 2; // 推进后的全局成员表版本号
+  uint64 route_version = 3;      // 推进后的路由表版本号
+}
+
+message GetMembershipRequest {
+  // known_membership_version 允许服务端未来做增量返回；当前 MVP
+  // 可忽略并返回全量。
+  uint64 known_membership_version =
+      1; // 客户端目前持有的版本号，用于控制面判断是否只需发送 Diff
+  bool include_tombstones =
+      2; // 是否拉取墓碑节点（用于缓存节点补齐历史销毁状态）
+}
+
+message GetMembershipResponse {
+  repeated Node nodes = 1; // 当前集群的节点状态列表
+  uint64 membership_version = 2; // 对应这批节点的成员表全局视图版本号
+  uint64 route_version = 3; // 对应的路由全局视图版本号
+}
+
+message SyncMembershipRequest {
+  repeated Node nodes =
+      1; // 发送方本地观测到的节点状态（通常用于多控制面 Gossip 同步）
+  uint64 membership_version = 2; // 发送方的视图版本号
+}
+
+message SyncMembershipResponse {
+  repeated Node nodes =
+      1; // 接收方经过冲突消解（Merge）后，返回给发送方需要修正的节点状态
+  uint64 membership_version = 2; // 接收方的最终成员表版本号
+  uint64 route_version = 3;      // 接收方的最终路由版本号
+}
+
+message RouteBlockRequest {
+  uint64 block_id = 1; // 客户端需要查询路由的数据块 ID
+  // candidates 表示需要返回的物理节点数量，包含 primary。
+  // 服务端应把 0 降级为 1。
+  uint32 candidates = 2; // 期望拉取的候选副本数量（用于设置 fallback 兜底策略）
+}
+
+message RouteBlockResponse {
+  uint64 block_id = 1; // 数据块 ID
+  Node primary = 2; // 绝对主路由节点（优先级最高，大概率在内存）
+  repeated Node candidates =
+      3; // 候选节点池（包含 primary 和其他备用副本，方便客户端本地切换）
+  uint64 route_version = 4; // 给出此路由决策时的路由表版本号
+}
+
+message AnnounceBlockRequest {
+  string node_id = 1;   // 完成落盘或载入内存操作的数据节点 ID
+  BlockMeta meta = 2;   // 节点底层硬件吐出来的物理元数据依据
+  StorageTier tier = 3; // 数据块存储的具体介质层级
+}
+
+message AnnounceBlockResponse {
+  BlockLocation location = 1; // 控制面记录完毕后的位置信息快照
+  uint64 location_version = 2; // 推高后的该数据块全局位置视图版本号
+}
+
+message ForgetBlockRequest {
+  string node_id = 1;   // 发生删除行为的节点 ID
+  uint64 block_id = 2;  // 被删除的数据块 ID
+  StorageTier tier = 3; // 是从哪层介质（内存或磁盘）删掉的
+  string reason = 4;    // 删除原因（如 "eviction_lru", "compaction"）
+}
+
+message ForgetBlockResponse {
+  uint64 block_id = 1; // 被确认删除的数据块 ID
+  string node_id = 2;  // 节点 ID
+  uint64 location_version =
+      3; // 执行物理删除并立下墓碑后，推进的该数据块全局位置视图版本号
+}
+
+message GetBlockLocationsRequest {
+  uint64 block_id = 1; // 客户端请求查询副本位置的数据块 ID
+}
+
+message GetBlockLocationsResponse {
+  uint64 block_id = 1; // 数据块 ID
+  repeated BlockLocation locations =
+      2; // 控制面聚合后的该块所有副本位置（通常已按照 StorageTier 排好序）
+  uint64 location_version =
+      3; // 此位置列表对应的全局版本号（用于客户端缓存失效判断）
+}
