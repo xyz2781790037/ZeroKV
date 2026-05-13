@@ -1,0 +1,5 @@
+csrc/build
+.codex
+.agents
+.vscode/
+*.out
