@@ -142,26 +142,6 @@ func alignUp(n, align uint64) (uint64, bool) {
 	return n + padding, true
 }
 
-// func alignUp(n, align uint64) (uint64, bool) {
-// 	if align == 0 {
-// 		return 0, false
-// 	}
-// 	// 验证 align 是否为 2 的幂次方 (例如 8, 4096)
-// 	// 二进制特性：一个数如果是 2 的幂，它与自己减一的按位与结果必然为 0
-// 	if align&(align-1) != 0 {
-// 		return 0, false
-// 	}
-
-// 	// 溢出检查：防止 n + (align - 1) 导致 uint64 绕回
-// 	if n > ^uint64(0)-(align-1) {
-// 		return 0, false
-// 	}
-
-//		// 核心位运算：
-//		// (n + align - 1) &^ (align - 1)
-//		// &^ 是 Go 的位清零操作符 (Bit Clear)。这等价于将低位全部抹零，实现极速的向上对齐。
-//		return (n + align - 1) &^ (align - 1), true
-//	}
 func maxMmapLen() uint64 {
 	return uint64(int(^uint(0) >> 1))
 }

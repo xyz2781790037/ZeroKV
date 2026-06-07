@@ -24,7 +24,7 @@ type Block struct {
 	Data         []byte // 【堆外内存切片视图】: 指向 OffheapPool 的 RAM 地址，脱离 Go GC 控管，属于严格只读负载
 }
 
-// Handler 处理 UDS 层解码后的 BlockReady 消息，并把块内容落到 OffheapPool。
+// Handler 处理数据面通知后的 block 落地，并把块内容登记到 OffheapPool。
 type Handler struct {
 	pool *OffheapPool
 	shm  *SharedMemoryPool
@@ -555,6 +555,22 @@ func (h *Handler) NewImportBlockWriter(blockID uint64, seq uint64, length uint64
 		expected: length,
 		checksum: checksum,
 	}, nil
+}
+
+// ImportBlock validates and publishes an already received block payload.
+// RDMA and remote-transfer writers use this path so they share the same
+// checksum, duplicate suppression, and lifecycle rules as P2P fetches.
+func (h *Handler) ImportBlock(blockID uint64, seq uint64, length uint64, checksum uint32, data []byte) (Block, error) {
+	if h == nil {
+		return Block{}, fmt.Errorf("storage handler: nil handler")
+	}
+	if uint64(len(data)) != length {
+		return Block{}, fmt.Errorf("storage handler: imported block %d length mismatch: expected=%d got=%d", blockID, length, len(data))
+	}
+	if actual := crc32.ChecksumIEEE(data); actual != checksum {
+		return Block{}, fmt.Errorf("storage handler: imported block %d checksum mismatch: expected=%d actual=%d", blockID, checksum, actual)
+	}
+	return h.importBlock(blockID, seq, length, checksum, data)
 }
 
 // Len 返回当前缓存中存储的块数量。

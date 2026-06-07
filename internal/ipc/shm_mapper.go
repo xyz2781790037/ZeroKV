@@ -194,14 +194,3 @@ func checkedMmapLength(length uint64) (int, error) {
 	}
 	return int(length), nil
 }
-
-// 它用于验证块是否被填满了 0xAB。生产代码应当使用 VerifyChecksum。
-func (b *ShmBlock) VerifyMockData() bool {
-	if b == nil || len(b.Data) == 0 {
-		return false
-	}
-	head := b.Data[0]
-	mid := b.Data[len(b.Data)/2]
-	tail := b.Data[len(b.Data)-1]
-	return head == 0xAB && mid == 0xAB && tail == 0xAB
-}
