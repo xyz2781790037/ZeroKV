@@ -24,10 +24,13 @@ var ErrDiskBlockNotFound = errors.New("disk tier: block not found")
 
 // 它是整个落盘模块的核心入口。大模型推理时内存极度宝贵，装不下的 KV Cache 会被驱逐（Evict）到本地磁盘上，DiskTier 就是管这些落在磁盘上的文件的。
 type DiskTier struct {
-	root         string                   // 【根目录路径】: 磁盘层存储数据的绝对或相对根路径，所有 .kvblk 文件存放于此。
-	mu           sync.RWMutex             // 【并发控制锁】: 保护 blocks 路由表和 invalidFiles 计数器的读写安全，确保并发访问不引发 data race。
-	blocks       map[uint64]DiskBlockMeta // 【内存索引表】: O(1) 路由字典，BlockID 映射到磁盘文件的元信息。启动时重建，内存中只存元数据不存实体。
-	invalidFiles uint64                   // 【损坏文件计数】: 记录在扫盘加载或运行期间发现的损坏、截断或魔数错误的脏文件总数，用于监控告警(Metrics)。
+	root            string // 【根目录路径】: 磁盘层存储数据的绝对或相对根路径，所有 .kvblk 文件存放于此。
+	manifestMu      sync.Mutex
+	mu              sync.RWMutex             // 【并发控制锁】: 保护 blocks 路由表和 invalidFiles 计数器的读写安全，确保并发访问不引发 data race。
+	blocks          map[uint64]DiskBlockMeta // 【内存索引表】: O(1) 路由字典，BlockID 映射到磁盘文件的元信息。启动时重建，内存中只存元数据不存实体。
+	manifests       map[[32]byte]CacheObjectManifest
+	manifestByBlock map[uint64][32]byte
+	invalidFiles    uint64 // 【损坏文件计数】: 记录在扫盘加载或运行期间发现的损坏、截断或魔数错误的脏文件总数，用于监控告警(Metrics)。
 }
 
 // 它是 DiskTier 路由表里的 Value。
@@ -99,10 +102,15 @@ func NewDiskTier(root string) (*DiskTier, error) {
 		return nil, fmt.Errorf("disk tier: create root %s: %w", cleanRoot, err)
 	}
 	tier := &DiskTier{
-		root:   cleanRoot,
-		blocks: make(map[uint64]DiskBlockMeta),
+		root:            cleanRoot,
+		blocks:          make(map[uint64]DiskBlockMeta),
+		manifests:       make(map[[32]byte]CacheObjectManifest),
+		manifestByBlock: make(map[uint64][32]byte),
 	}
 	if err := tier.loadIndex(); err != nil {
+		return nil, err
+	}
+	if err := tier.loadCacheManifests(); err != nil {
 		return nil, err
 	}
 	return tier, nil
@@ -226,13 +234,16 @@ func (d *DiskTier) Delete(blockID uint64) error {
 	}
 	d.mu.Unlock()
 	if !ok {
-		return nil
+		return d.DeleteCacheManifestByBlock(blockID)
 	}
 	if err := os.Remove(meta.Path); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("disk tier: delete block %d: %w", blockID, err)
 	}
 	if err := syncDir(d.root); err != nil {
 		return fmt.Errorf("disk tier: sync root after delete block %d: %w", blockID, err)
+	}
+	if err := d.DeleteCacheManifestByBlock(blockID); err != nil {
+		return err
 	}
 	return nil
 }
