@@ -91,6 +91,34 @@ func (h *Handler) Evict(policy EvictPolicy) (EvictResult, error) {
 	return result, nil
 }
 
+func (h *Handler) DeleteBlock(blockID uint64) (BlockMeta, bool, error) {
+	if h == nil {
+		return BlockMeta{}, false, fmt.Errorf("storage handler: nil handler")
+	}
+	if blockID == 0 {
+		return BlockMeta{}, false, fmt.Errorf("storage handler: zero block id")
+	}
+	h.lifecycle.RLock()
+	defer h.lifecycle.RUnlock()
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	block, ok := h.blocks[blockID]
+	if !ok {
+		return BlockMeta{}, false, nil
+	}
+	if h.leases[blockID] > 0 {
+		return blockMeta(block), true, ErrBlockBusy
+	}
+	if _, busy := h.evicting[blockID]; busy {
+		return blockMeta(block), true, ErrBlockBusy
+	}
+	delete(h.blocks, blockID)
+	delete(h.pending, blockID)
+	return blockMeta(block), true, nil
+}
+
 // ReclaimAll 是物理回收入口，本质上等价于 Reset。
 // 它会等待所有通过 Acquire 发出的 lease 释放后，再清空索引并复用 OffheapPool。
 func (h *Handler) ReclaimAll() {
