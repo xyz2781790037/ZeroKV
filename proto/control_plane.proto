@@ -71,6 +71,9 @@ message BlockMeta {
       3; // 数据块的 CRC32/Murmur3 校验和（核心：防硬件静默损坏 Data Rot）
   uint64 generation = 4; // 世代号（用于冷热数据置换、多版本控制或垃圾回收标记）
   uint64 seq = 5; // 序列号（用于同一 block 的修改时序控制）
+  // 完整语义对象 ID。旧的物理块写入可留空；只有完成 CacheObject commit
+  // 后才发布 32 字节 SHA-256，用于 Prefix Lookup 排除 uint64 BlockID 碰撞。
+  bytes object_id = 6;
 }
 
 message BlockLocation {

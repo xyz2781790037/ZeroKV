@@ -24,11 +24,11 @@ const (
 type NodeState int32
 
 const (
-	NodeState_NODE_STATE_UNKNOWN   NodeState = 0
-	NodeState_NODE_STATE_ALIVE     NodeState = 1
-	NodeState_NODE_STATE_SUSPECT   NodeState = 2
-	NodeState_NODE_STATE_DOWN      NodeState = 3
-	NodeState_NODE_STATE_TOMBSTONE NodeState = 4
+	NodeState_NODE_STATE_UNKNOWN   NodeState = 0 // 未知状态（默认零值，防止空指针解析）
+	NodeState_NODE_STATE_ALIVE     NodeState = 1 // 正常存活，算力可用，可接收读写流量
+	NodeState_NODE_STATE_SUSPECT   NodeState = 2 // 疑似宕机（心跳超时，但尚未确诊或走完彻底剔除流程）
+	NodeState_NODE_STATE_DOWN      NodeState = 3 // 确诊宕机，算力不可用，需将流量路由至其他副本
+	NodeState_NODE_STATE_TOMBSTONE NodeState = 4 // 墓碑状态（已彻底物理/逻辑下线，用于压制网络乱序旧包防复活）
 )
 
 // Enum value maps for NodeState.
@@ -79,9 +79,9 @@ func (NodeState) EnumDescriptor() ([]byte, []int) {
 type StorageTier int32
 
 const (
-	StorageTier_STORAGE_TIER_UNKNOWN StorageTier = 0
-	StorageTier_STORAGE_TIER_MEMORY  StorageTier = 1
-	StorageTier_STORAGE_TIER_DISK    StorageTier = 2
+	StorageTier_STORAGE_TIER_UNKNOWN StorageTier = 0 // 未知存储层级
+	StorageTier_STORAGE_TIER_MEMORY  StorageTier = 1 // 内存层（访问延迟最低，通常为第一路由优先级）
+	StorageTier_STORAGE_TIER_DISK    StorageTier = 2 // 磁盘层（如 NVMe/SSD，容量大但延迟相对较高，作为兜底）
 )
 
 // Enum value maps for StorageTier.
@@ -127,11 +127,11 @@ func (StorageTier) EnumDescriptor() ([]byte, []int) {
 
 type Node struct {
 	state                 protoimpl.MessageState `protogen:"open.v1"`
-	Id                    string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
-	Addr                  string                 `protobuf:"bytes,2,opt,name=addr,proto3" json:"addr,omitempty"`
-	State                 NodeState              `protobuf:"varint,3,opt,name=state,proto3,enum=kvcache.controlplane.v1.NodeState" json:"state,omitempty"`
-	Version               uint64                 `protobuf:"varint,4,opt,name=version,proto3" json:"version,omitempty"`
-	LastHeartbeatUnixNano int64                  `protobuf:"varint,5,opt,name=last_heartbeat_unix_nano,json=lastHeartbeatUnixNano,proto3" json:"last_heartbeat_unix_nano,omitempty"`
+	Id                    string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`                                                                         // 节点全局唯一标识符（UUID/Snowflake ID）
+	Addr                  string                 `protobuf:"bytes,2,opt,name=addr,proto3" json:"addr,omitempty"`                                                                     // 节点的网络可达地址（例如 "192.168.1.100:8080"）
+	State                 NodeState              `protobuf:"varint,3,opt,name=state,proto3,enum=kvcache.controlplane.v1.NodeState" json:"state,omitempty"`                           // 节点当前的生命周期状态
+	Version               uint64                 `protobuf:"varint,4,opt,name=version,proto3" json:"version,omitempty"`                                                              // 节点状态单调递增版本号（核心：防并发修改时旧状态覆盖新状态）
+	LastHeartbeatUnixNano int64                  `protobuf:"varint,5,opt,name=last_heartbeat_unix_nano,json=lastHeartbeatUnixNano,proto3" json:"last_heartbeat_unix_nano,omitempty"` // 节点最后一次成功心跳的绝对物理时间戳（纳秒，用于精准计算超时）
 	unknownFields         protoimpl.UnknownFields
 	sizeCache             protoimpl.SizeCache
 }
@@ -202,12 +202,15 @@ func (x *Node) GetLastHeartbeatUnixNano() int64 {
 }
 
 type BlockMeta struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	BlockId       uint64                 `protobuf:"varint,1,opt,name=block_id,json=blockId,proto3" json:"block_id,omitempty"`
-	Length        uint64                 `protobuf:"varint,2,opt,name=length,proto3" json:"length,omitempty"`
-	Checksum      uint32                 `protobuf:"varint,3,opt,name=checksum,proto3" json:"checksum,omitempty"`
-	Generation    uint64                 `protobuf:"varint,4,opt,name=generation,proto3" json:"generation,omitempty"`
-	Seq           uint64                 `protobuf:"varint,5,opt,name=seq,proto3" json:"seq,omitempty"`
+	state      protoimpl.MessageState `protogen:"open.v1"`
+	BlockId    uint64                 `protobuf:"varint,1,opt,name=block_id,json=blockId,proto3" json:"block_id,omitempty"` // 数据块的全局唯一 ID
+	Length     uint64                 `protobuf:"varint,2,opt,name=length,proto3" json:"length,omitempty"`                  // 数据块物理大小的精确字节数（用于客户端拉取时预分配内存）
+	Checksum   uint32                 `protobuf:"varint,3,opt,name=checksum,proto3" json:"checksum,omitempty"`              // 数据块的 CRC32/Murmur3 校验和（核心：防硬件静默损坏 Data Rot）
+	Generation uint64                 `protobuf:"varint,4,opt,name=generation,proto3" json:"generation,omitempty"`          // 世代号（用于冷热数据置换、多版本控制或垃圾回收标记）
+	Seq        uint64                 `protobuf:"varint,5,opt,name=seq,proto3" json:"seq,omitempty"`                        // 序列号（用于同一 block 的修改时序控制）
+	// 完整语义对象 ID。旧的物理块写入可留空；只有完成 CacheObject commit
+	// 后才发布 32 字节 SHA-256，用于 Prefix Lookup 排除 uint64 BlockID 碰撞。
+	ObjectId      []byte `protobuf:"bytes,6,opt,name=object_id,json=objectId,proto3" json:"object_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -277,14 +280,21 @@ func (x *BlockMeta) GetSeq() uint64 {
 	return 0
 }
 
+func (x *BlockMeta) GetObjectId() []byte {
+	if x != nil {
+		return x.ObjectId
+	}
+	return nil
+}
+
 type BlockLocation struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
-	BlockId       uint64                 `protobuf:"varint,1,opt,name=block_id,json=blockId,proto3" json:"block_id,omitempty"`
-	NodeId        string                 `protobuf:"bytes,2,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"`
-	Addr          string                 `protobuf:"bytes,3,opt,name=addr,proto3" json:"addr,omitempty"`
-	Tier          StorageTier            `protobuf:"varint,4,opt,name=tier,proto3,enum=kvcache.controlplane.v1.StorageTier" json:"tier,omitempty"`
-	Meta          *BlockMeta             `protobuf:"bytes,5,opt,name=meta,proto3" json:"meta,omitempty"`
-	Version       uint64                 `protobuf:"varint,6,opt,name=version,proto3" json:"version,omitempty"`
+	BlockId       uint64                 `protobuf:"varint,1,opt,name=block_id,json=blockId,proto3" json:"block_id,omitempty"`                     // 数据块 ID
+	NodeId        string                 `protobuf:"bytes,2,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"`                         // 持有该数据块副本的物理节点 ID
+	Addr          string                 `protobuf:"bytes,3,opt,name=addr,proto3" json:"addr,omitempty"`                                           // 持有节点的物理网络地址（方便客户端直连拉取数据面）
+	Tier          StorageTier            `protobuf:"varint,4,opt,name=tier,proto3,enum=kvcache.controlplane.v1.StorageTier" json:"tier,omitempty"` // 当前副本存放在内存还是磁盘
+	Meta          *BlockMeta             `protobuf:"bytes,5,opt,name=meta,proto3" json:"meta,omitempty"`                                           // 该副本底层的客观事实元数据（大小、校验和，不可被网络层篡改）
+	Version       uint64                 `protobuf:"varint,6,opt,name=version,proto3" json:"version,omitempty"`                                    // 此位置信息的最后修改版本号（核心：防乱序网络包导致的幽灵复活）
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -363,7 +373,7 @@ func (x *BlockLocation) GetVersion() uint64 {
 
 type RegisterNodeRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
-	Node          *Node                  `protobuf:"bytes,1,opt,name=node,proto3" json:"node,omitempty"`
+	Node          *Node                  `protobuf:"bytes,1,opt,name=node,proto3" json:"node,omitempty"` // 申请加入集群的节点自我描述信息
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -407,9 +417,9 @@ func (x *RegisterNodeRequest) GetNode() *Node {
 
 type RegisterNodeResponse struct {
 	state             protoimpl.MessageState `protogen:"open.v1"`
-	Self              *Node                  `protobuf:"bytes,1,opt,name=self,proto3" json:"self,omitempty"`
-	MembershipVersion uint64                 `protobuf:"varint,2,opt,name=membership_version,json=membershipVersion,proto3" json:"membership_version,omitempty"`
-	RouteVersion      uint64                 `protobuf:"varint,3,opt,name=route_version,json=routeVersion,proto3" json:"route_version,omitempty"`
+	Self              *Node                  `protobuf:"bytes,1,opt,name=self,proto3" json:"self,omitempty"`                                                     // 控制面合并加工后，最终认定的该节点完整状态快照
+	MembershipVersion uint64                 `protobuf:"varint,2,opt,name=membership_version,json=membershipVersion,proto3" json:"membership_version,omitempty"` // 注册完成后，推进的全局集群成员表版本号
+	RouteVersion      uint64                 `protobuf:"varint,3,opt,name=route_version,json=routeVersion,proto3" json:"route_version,omitempty"`                // 注册后如果触发了拓扑重计算，返回最新的路由版本号
 	unknownFields     protoimpl.UnknownFields
 	sizeCache         protoimpl.SizeCache
 }
@@ -467,8 +477,8 @@ func (x *RegisterNodeResponse) GetRouteVersion() uint64 {
 
 type HeartbeatRequest struct {
 	state             protoimpl.MessageState `protogen:"open.v1"`
-	NodeId            string                 `protobuf:"bytes,1,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"`
-	HeartbeatUnixNano int64                  `protobuf:"varint,2,opt,name=heartbeat_unix_nano,json=heartbeatUnixNano,proto3" json:"heartbeat_unix_nano,omitempty"`
+	NodeId            string                 `protobuf:"bytes,1,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"`                                     // 汇报心跳的节点 ID
+	HeartbeatUnixNano int64                  `protobuf:"varint,2,opt,name=heartbeat_unix_nano,json=heartbeatUnixNano,proto3" json:"heartbeat_unix_nano,omitempty"` // 发出心跳时的客户端本地绝对时间戳（纳秒）
 	unknownFields     protoimpl.UnknownFields
 	sizeCache         protoimpl.SizeCache
 }
@@ -519,9 +529,9 @@ func (x *HeartbeatRequest) GetHeartbeatUnixNano() int64 {
 
 type HeartbeatResponse struct {
 	state             protoimpl.MessageState `protogen:"open.v1"`
-	Node              *Node                  `protobuf:"bytes,1,opt,name=node,proto3" json:"node,omitempty"`
-	MembershipVersion uint64                 `protobuf:"varint,2,opt,name=membership_version,json=membershipVersion,proto3" json:"membership_version,omitempty"`
-	RouteVersion      uint64                 `protobuf:"varint,3,opt,name=route_version,json=routeVersion,proto3" json:"route_version,omitempty"`
+	Node              *Node                  `protobuf:"bytes,1,opt,name=node,proto3" json:"node,omitempty"`                                                     // 控制面视角下该节点的最新状态（用于纠正节点自身的脑裂错觉）
+	MembershipVersion uint64                 `protobuf:"varint,2,opt,name=membership_version,json=membershipVersion,proto3" json:"membership_version,omitempty"` // 当前全局成员表版本号（告知节点是否有其他机器加入/退出）
+	RouteVersion      uint64                 `protobuf:"varint,3,opt,name=route_version,json=routeVersion,proto3" json:"route_version,omitempty"`                // 当前路由表版本号
 	unknownFields     protoimpl.UnknownFields
 	sizeCache         protoimpl.SizeCache
 }
@@ -579,8 +589,8 @@ func (x *HeartbeatResponse) GetRouteVersion() uint64 {
 
 type LeaveNodeRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
-	NodeId        string                 `protobuf:"bytes,1,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"`
-	Reason        string                 `protobuf:"bytes,2,opt,name=reason,proto3" json:"reason,omitempty"`
+	NodeId        string                 `protobuf:"bytes,1,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"` // 申请主动下线的节点 ID
+	Reason        string                 `protobuf:"bytes,2,opt,name=reason,proto3" json:"reason,omitempty"`               // 下线原因（如 "SIGTERM", "MAINTENANCE"，供控制面打日志排查）
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -631,9 +641,9 @@ func (x *LeaveNodeRequest) GetReason() string {
 
 type LeaveNodeResponse struct {
 	state             protoimpl.MessageState `protogen:"open.v1"`
-	Tombstone         *Node                  `protobuf:"bytes,1,opt,name=tombstone,proto3" json:"tombstone,omitempty"`
-	MembershipVersion uint64                 `protobuf:"varint,2,opt,name=membership_version,json=membershipVersion,proto3" json:"membership_version,omitempty"`
-	RouteVersion      uint64                 `protobuf:"varint,3,opt,name=route_version,json=routeVersion,proto3" json:"route_version,omitempty"`
+	Tombstone         *Node                  `protobuf:"bytes,1,opt,name=tombstone,proto3" json:"tombstone,omitempty"`                                           // 控制面为该节点生成的带有最新 version 的墓碑记录快照
+	MembershipVersion uint64                 `protobuf:"varint,2,opt,name=membership_version,json=membershipVersion,proto3" json:"membership_version,omitempty"` // 推进后的全局成员表版本号
+	RouteVersion      uint64                 `protobuf:"varint,3,opt,name=route_version,json=routeVersion,proto3" json:"route_version,omitempty"`                // 推进后的路由表版本号
 	unknownFields     protoimpl.UnknownFields
 	sizeCache         protoimpl.SizeCache
 }
@@ -691,9 +701,10 @@ func (x *LeaveNodeResponse) GetRouteVersion() uint64 {
 
 type GetMembershipRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// known_membership_version 允许服务端未来做增量返回；当前 MVP 可忽略并返回全量。
-	KnownMembershipVersion uint64 `protobuf:"varint,1,opt,name=known_membership_version,json=knownMembershipVersion,proto3" json:"known_membership_version,omitempty"`
-	IncludeTombstones      bool   `protobuf:"varint,2,opt,name=include_tombstones,json=includeTombstones,proto3" json:"include_tombstones,omitempty"`
+	// known_membership_version 允许服务端未来做增量返回；当前 MVP
+	// 可忽略并返回全量。
+	KnownMembershipVersion uint64 `protobuf:"varint,1,opt,name=known_membership_version,json=knownMembershipVersion,proto3" json:"known_membership_version,omitempty"` // 客户端目前持有的版本号，用于控制面判断是否只需发送 Diff
+	IncludeTombstones      bool   `protobuf:"varint,2,opt,name=include_tombstones,json=includeTombstones,proto3" json:"include_tombstones,omitempty"`                  // 是否拉取墓碑节点（用于缓存节点补齐历史销毁状态）
 	unknownFields          protoimpl.UnknownFields
 	sizeCache              protoimpl.SizeCache
 }
@@ -744,9 +755,9 @@ func (x *GetMembershipRequest) GetIncludeTombstones() bool {
 
 type GetMembershipResponse struct {
 	state             protoimpl.MessageState `protogen:"open.v1"`
-	Nodes             []*Node                `protobuf:"bytes,1,rep,name=nodes,proto3" json:"nodes,omitempty"`
-	MembershipVersion uint64                 `protobuf:"varint,2,opt,name=membership_version,json=membershipVersion,proto3" json:"membership_version,omitempty"`
-	RouteVersion      uint64                 `protobuf:"varint,3,opt,name=route_version,json=routeVersion,proto3" json:"route_version,omitempty"`
+	Nodes             []*Node                `protobuf:"bytes,1,rep,name=nodes,proto3" json:"nodes,omitempty"`                                                   // 当前集群的节点状态列表
+	MembershipVersion uint64                 `protobuf:"varint,2,opt,name=membership_version,json=membershipVersion,proto3" json:"membership_version,omitempty"` // 对应这批节点的成员表全局视图版本号
+	RouteVersion      uint64                 `protobuf:"varint,3,opt,name=route_version,json=routeVersion,proto3" json:"route_version,omitempty"`                // 对应的路由全局视图版本号
 	unknownFields     protoimpl.UnknownFields
 	sizeCache         protoimpl.SizeCache
 }
@@ -804,8 +815,8 @@ func (x *GetMembershipResponse) GetRouteVersion() uint64 {
 
 type SyncMembershipRequest struct {
 	state             protoimpl.MessageState `protogen:"open.v1"`
-	Nodes             []*Node                `protobuf:"bytes,1,rep,name=nodes,proto3" json:"nodes,omitempty"`
-	MembershipVersion uint64                 `protobuf:"varint,2,opt,name=membership_version,json=membershipVersion,proto3" json:"membership_version,omitempty"`
+	Nodes             []*Node                `protobuf:"bytes,1,rep,name=nodes,proto3" json:"nodes,omitempty"`                                                   // 发送方本地观测到的节点状态（通常用于多控制面 Gossip 同步）
+	MembershipVersion uint64                 `protobuf:"varint,2,opt,name=membership_version,json=membershipVersion,proto3" json:"membership_version,omitempty"` // 发送方的视图版本号
 	unknownFields     protoimpl.UnknownFields
 	sizeCache         protoimpl.SizeCache
 }
@@ -856,9 +867,9 @@ func (x *SyncMembershipRequest) GetMembershipVersion() uint64 {
 
 type SyncMembershipResponse struct {
 	state             protoimpl.MessageState `protogen:"open.v1"`
-	Nodes             []*Node                `protobuf:"bytes,1,rep,name=nodes,proto3" json:"nodes,omitempty"`
-	MembershipVersion uint64                 `protobuf:"varint,2,opt,name=membership_version,json=membershipVersion,proto3" json:"membership_version,omitempty"`
-	RouteVersion      uint64                 `protobuf:"varint,3,opt,name=route_version,json=routeVersion,proto3" json:"route_version,omitempty"`
+	Nodes             []*Node                `protobuf:"bytes,1,rep,name=nodes,proto3" json:"nodes,omitempty"`                                                   // 接收方经过冲突消解（Merge）后，返回给发送方需要修正的节点状态
+	MembershipVersion uint64                 `protobuf:"varint,2,opt,name=membership_version,json=membershipVersion,proto3" json:"membership_version,omitempty"` // 接收方的最终成员表版本号
+	RouteVersion      uint64                 `protobuf:"varint,3,opt,name=route_version,json=routeVersion,proto3" json:"route_version,omitempty"`                // 接收方的最终路由版本号
 	unknownFields     protoimpl.UnknownFields
 	sizeCache         protoimpl.SizeCache
 }
@@ -916,10 +927,10 @@ func (x *SyncMembershipResponse) GetRouteVersion() uint64 {
 
 type RouteBlockRequest struct {
 	state   protoimpl.MessageState `protogen:"open.v1"`
-	BlockId uint64                 `protobuf:"varint,1,opt,name=block_id,json=blockId,proto3" json:"block_id,omitempty"`
+	BlockId uint64                 `protobuf:"varint,1,opt,name=block_id,json=blockId,proto3" json:"block_id,omitempty"` // 客户端需要查询路由的数据块 ID
 	// candidates 表示需要返回的物理节点数量，包含 primary。
 	// 服务端应把 0 降级为 1。
-	Candidates    uint32 `protobuf:"varint,2,opt,name=candidates,proto3" json:"candidates,omitempty"`
+	Candidates    uint32 `protobuf:"varint,2,opt,name=candidates,proto3" json:"candidates,omitempty"` // 期望拉取的候选副本数量（用于设置 fallback 兜底策略）
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -970,10 +981,10 @@ func (x *RouteBlockRequest) GetCandidates() uint32 {
 
 type RouteBlockResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
-	BlockId       uint64                 `protobuf:"varint,1,opt,name=block_id,json=blockId,proto3" json:"block_id,omitempty"`
-	Primary       *Node                  `protobuf:"bytes,2,opt,name=primary,proto3" json:"primary,omitempty"`
-	Candidates    []*Node                `protobuf:"bytes,3,rep,name=candidates,proto3" json:"candidates,omitempty"`
-	RouteVersion  uint64                 `protobuf:"varint,4,opt,name=route_version,json=routeVersion,proto3" json:"route_version,omitempty"`
+	BlockId       uint64                 `protobuf:"varint,1,opt,name=block_id,json=blockId,proto3" json:"block_id,omitempty"`                // 数据块 ID
+	Primary       *Node                  `protobuf:"bytes,2,opt,name=primary,proto3" json:"primary,omitempty"`                                // 绝对主路由节点（优先级最高，大概率在内存）
+	Candidates    []*Node                `protobuf:"bytes,3,rep,name=candidates,proto3" json:"candidates,omitempty"`                          // 候选节点池（包含 primary 和其他备用副本，方便客户端本地切换）
+	RouteVersion  uint64                 `protobuf:"varint,4,opt,name=route_version,json=routeVersion,proto3" json:"route_version,omitempty"` // 给出此路由决策时的路由表版本号
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1038,9 +1049,9 @@ func (x *RouteBlockResponse) GetRouteVersion() uint64 {
 
 type AnnounceBlockRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
-	NodeId        string                 `protobuf:"bytes,1,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"`
-	Meta          *BlockMeta             `protobuf:"bytes,2,opt,name=meta,proto3" json:"meta,omitempty"`
-	Tier          StorageTier            `protobuf:"varint,3,opt,name=tier,proto3,enum=kvcache.controlplane.v1.StorageTier" json:"tier,omitempty"`
+	NodeId        string                 `protobuf:"bytes,1,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"`                         // 完成落盘或载入内存操作的数据节点 ID
+	Meta          *BlockMeta             `protobuf:"bytes,2,opt,name=meta,proto3" json:"meta,omitempty"`                                           // 节点底层硬件吐出来的物理元数据依据
+	Tier          StorageTier            `protobuf:"varint,3,opt,name=tier,proto3,enum=kvcache.controlplane.v1.StorageTier" json:"tier,omitempty"` // 数据块存储的具体介质层级
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1098,8 +1109,8 @@ func (x *AnnounceBlockRequest) GetTier() StorageTier {
 
 type AnnounceBlockResponse struct {
 	state           protoimpl.MessageState `protogen:"open.v1"`
-	Location        *BlockLocation         `protobuf:"bytes,1,opt,name=location,proto3" json:"location,omitempty"`
-	LocationVersion uint64                 `protobuf:"varint,2,opt,name=location_version,json=locationVersion,proto3" json:"location_version,omitempty"`
+	Location        *BlockLocation         `protobuf:"bytes,1,opt,name=location,proto3" json:"location,omitempty"`                                       // 控制面记录完毕后的位置信息快照
+	LocationVersion uint64                 `protobuf:"varint,2,opt,name=location_version,json=locationVersion,proto3" json:"location_version,omitempty"` // 推高后的该数据块全局位置视图版本号
 	unknownFields   protoimpl.UnknownFields
 	sizeCache       protoimpl.SizeCache
 }
@@ -1150,10 +1161,10 @@ func (x *AnnounceBlockResponse) GetLocationVersion() uint64 {
 
 type ForgetBlockRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
-	NodeId        string                 `protobuf:"bytes,1,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"`
-	BlockId       uint64                 `protobuf:"varint,2,opt,name=block_id,json=blockId,proto3" json:"block_id,omitempty"`
-	Tier          StorageTier            `protobuf:"varint,3,opt,name=tier,proto3,enum=kvcache.controlplane.v1.StorageTier" json:"tier,omitempty"`
-	Reason        string                 `protobuf:"bytes,4,opt,name=reason,proto3" json:"reason,omitempty"`
+	NodeId        string                 `protobuf:"bytes,1,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"`                         // 发生删除行为的节点 ID
+	BlockId       uint64                 `protobuf:"varint,2,opt,name=block_id,json=blockId,proto3" json:"block_id,omitempty"`                     // 被删除的数据块 ID
+	Tier          StorageTier            `protobuf:"varint,3,opt,name=tier,proto3,enum=kvcache.controlplane.v1.StorageTier" json:"tier,omitempty"` // 是从哪层介质（内存或磁盘）删掉的
+	Reason        string                 `protobuf:"bytes,4,opt,name=reason,proto3" json:"reason,omitempty"`                                       // 删除原因（如 "eviction_lru", "compaction"）
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1218,9 +1229,9 @@ func (x *ForgetBlockRequest) GetReason() string {
 
 type ForgetBlockResponse struct {
 	state           protoimpl.MessageState `protogen:"open.v1"`
-	BlockId         uint64                 `protobuf:"varint,1,opt,name=block_id,json=blockId,proto3" json:"block_id,omitempty"`
-	NodeId          string                 `protobuf:"bytes,2,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"`
-	LocationVersion uint64                 `protobuf:"varint,3,opt,name=location_version,json=locationVersion,proto3" json:"location_version,omitempty"`
+	BlockId         uint64                 `protobuf:"varint,1,opt,name=block_id,json=blockId,proto3" json:"block_id,omitempty"`                         // 被确认删除的数据块 ID
+	NodeId          string                 `protobuf:"bytes,2,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"`                             // 节点 ID
+	LocationVersion uint64                 `protobuf:"varint,3,opt,name=location_version,json=locationVersion,proto3" json:"location_version,omitempty"` // 执行物理删除并立下墓碑后，推进的该数据块全局位置视图版本号
 	unknownFields   protoimpl.UnknownFields
 	sizeCache       protoimpl.SizeCache
 }
@@ -1278,7 +1289,7 @@ func (x *ForgetBlockResponse) GetLocationVersion() uint64 {
 
 type GetBlockLocationsRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
-	BlockId       uint64                 `protobuf:"varint,1,opt,name=block_id,json=blockId,proto3" json:"block_id,omitempty"`
+	BlockId       uint64                 `protobuf:"varint,1,opt,name=block_id,json=blockId,proto3" json:"block_id,omitempty"` // 客户端请求查询副本位置的数据块 ID
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1322,9 +1333,9 @@ func (x *GetBlockLocationsRequest) GetBlockId() uint64 {
 
 type GetBlockLocationsResponse struct {
 	state           protoimpl.MessageState `protogen:"open.v1"`
-	BlockId         uint64                 `protobuf:"varint,1,opt,name=block_id,json=blockId,proto3" json:"block_id,omitempty"`
-	Locations       []*BlockLocation       `protobuf:"bytes,2,rep,name=locations,proto3" json:"locations,omitempty"`
-	LocationVersion uint64                 `protobuf:"varint,3,opt,name=location_version,json=locationVersion,proto3" json:"location_version,omitempty"`
+	BlockId         uint64                 `protobuf:"varint,1,opt,name=block_id,json=blockId,proto3" json:"block_id,omitempty"`                         // 数据块 ID
+	Locations       []*BlockLocation       `protobuf:"bytes,2,rep,name=locations,proto3" json:"locations,omitempty"`                                     // 控制面聚合后的该块所有副本位置（通常已按照 StorageTier 排好序）
+	LocationVersion uint64                 `protobuf:"varint,3,opt,name=location_version,json=locationVersion,proto3" json:"location_version,omitempty"` // 此位置列表对应的全局版本号（用于客户端缓存失效判断）
 	unknownFields   protoimpl.UnknownFields
 	sizeCache       protoimpl.SizeCache
 }
@@ -1390,7 +1401,7 @@ const file_control_plane_proto_rawDesc = "" +
 	"\x04addr\x18\x02 \x01(\tR\x04addr\x128\n" +
 	"\x05state\x18\x03 \x01(\x0e2\".kvcache.controlplane.v1.NodeStateR\x05state\x12\x18\n" +
 	"\aversion\x18\x04 \x01(\x04R\aversion\x127\n" +
-	"\x18last_heartbeat_unix_nano\x18\x05 \x01(\x03R\x15lastHeartbeatUnixNano\"\x8c\x01\n" +
+	"\x18last_heartbeat_unix_nano\x18\x05 \x01(\x03R\x15lastHeartbeatUnixNano\"\xa9\x01\n" +
 	"\tBlockMeta\x12\x19\n" +
 	"\bblock_id\x18\x01 \x01(\x04R\ablockId\x12\x16\n" +
 	"\x06length\x18\x02 \x01(\x04R\x06length\x12\x1a\n" +
@@ -1398,7 +1409,8 @@ const file_control_plane_proto_rawDesc = "" +
 	"\n" +
 	"generation\x18\x04 \x01(\x04R\n" +
 	"generation\x12\x10\n" +
-	"\x03seq\x18\x05 \x01(\x04R\x03seq\"\xe3\x01\n" +
+	"\x03seq\x18\x05 \x01(\x04R\x03seq\x12\x1b\n" +
+	"\tobject_id\x18\x06 \x01(\fR\bobjectId\"\xe3\x01\n" +
 	"\rBlockLocation\x12\x19\n" +
 	"\bblock_id\x18\x01 \x01(\x04R\ablockId\x12\x17\n" +
 	"\anode_id\x18\x02 \x01(\tR\x06nodeId\x12\x12\n" +

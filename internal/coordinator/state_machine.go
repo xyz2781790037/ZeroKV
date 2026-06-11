@@ -23,6 +23,7 @@ type BlockMetaRecord struct {
 	Checksum   uint32
 	Generation uint64
 	Seq        uint64
+	ObjectID   [32]byte
 }
 
 // locationKey 作为 locationBlock 内部 Map 的联合键

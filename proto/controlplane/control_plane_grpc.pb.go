@@ -35,7 +35,8 @@ const (
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 //
 // ControlPlane 只承载集群控制面信息：membership、路由、block 元数据。
-// 大块 KV payload 不走 gRPC/protobuf，继续通过 internal/network 的 P2P 流式 TCP 传输。
+// 大块 KV payload 不走 gRPC/protobuf，继续通过 internal/network 的 P2P 流式 TCP
+// 传输。
 type ControlPlaneClient interface {
 	// RegisterNode 把一个节点加入集群成员表，通常在 daemon 启动时调用。
 	RegisterNode(ctx context.Context, in *RegisterNodeRequest, opts ...grpc.CallOption) (*RegisterNodeResponse, error)
@@ -45,7 +46,8 @@ type ControlPlaneClient interface {
 	LeaveNode(ctx context.Context, in *LeaveNodeRequest, opts ...grpc.CallOption) (*LeaveNodeResponse, error)
 	// GetMembership 拉取当前成员表快照，供新节点启动或拓扑缓存刷新使用。
 	GetMembership(ctx context.Context, in *GetMembershipRequest, opts ...grpc.CallOption) (*GetMembershipResponse, error)
-	// SyncMembership 向对端推送本地观察到的成员状态，用于 gossip/多 coordinator 同步。
+	// SyncMembership 向对端推送本地观察到的成员状态，用于 gossip/多 coordinator
+	// 同步。
 	SyncMembership(ctx context.Context, in *SyncMembershipRequest, opts ...grpc.CallOption) (*SyncMembershipResponse, error)
 	// RouteBlock 查询 blockID 对应的 primary 和 fallback 节点。
 	RouteBlock(ctx context.Context, in *RouteBlockRequest, opts ...grpc.CallOption) (*RouteBlockResponse, error)
@@ -160,7 +162,8 @@ func (c *controlPlaneClient) GetBlockLocations(ctx context.Context, in *GetBlock
 // for forward compatibility.
 //
 // ControlPlane 只承载集群控制面信息：membership、路由、block 元数据。
-// 大块 KV payload 不走 gRPC/protobuf，继续通过 internal/network 的 P2P 流式 TCP 传输。
+// 大块 KV payload 不走 gRPC/protobuf，继续通过 internal/network 的 P2P 流式 TCP
+// 传输。
 type ControlPlaneServer interface {
 	// RegisterNode 把一个节点加入集群成员表，通常在 daemon 启动时调用。
 	RegisterNode(context.Context, *RegisterNodeRequest) (*RegisterNodeResponse, error)
@@ -170,7 +173,8 @@ type ControlPlaneServer interface {
 	LeaveNode(context.Context, *LeaveNodeRequest) (*LeaveNodeResponse, error)
 	// GetMembership 拉取当前成员表快照，供新节点启动或拓扑缓存刷新使用。
 	GetMembership(context.Context, *GetMembershipRequest) (*GetMembershipResponse, error)
-	// SyncMembership 向对端推送本地观察到的成员状态，用于 gossip/多 coordinator 同步。
+	// SyncMembership 向对端推送本地观察到的成员状态，用于 gossip/多 coordinator
+	// 同步。
 	SyncMembership(context.Context, *SyncMembershipRequest) (*SyncMembershipResponse, error)
 	// RouteBlock 查询 blockID 对应的 primary 和 fallback 节点。
 	RouteBlock(context.Context, *RouteBlockRequest) (*RouteBlockResponse, error)

@@ -40,7 +40,7 @@ func (s *ControlPlaneService) RegisterNode(ctx context.Context, req *controlplan
 	return &controlplane.RegisterNodeResponse{
 		Self:              nodeToProto(latest),
 		MembershipVersion: version,
-		// [修复]：只返回当前最终一致性的路由版本
+		// 路由刷新是防抖异步执行的，这里返回当前已发布的路由版本。
 		RouteVersion: s.currentRouteVersion(),
 	}, nil
 }
@@ -205,16 +205,19 @@ func (s *ControlPlaneService) AnnounceBlock(ctx context.Context, req *controlpla
 	if meta.GetBlockId() == 0 {
 		return nil, status.Error(codes.InvalidArgument, "control plane: zero block id")
 	}
+	if objectID := meta.GetObjectId(); len(objectID) != 0 && len(objectID) != 32 {
+		return nil, status.Error(codes.InvalidArgument, "control plane: object id must be empty or 32 bytes")
+	}
 
 	record := blockLocationRecord{
-		nodeID: node.ID, // [修复]：提取 NodeID
+		nodeID: node.ID,
 		tier:   req.GetTier(),
 		meta:   blockMetaRecordFromProto(meta),
 	}
 	// 追加 WAL，分配最新逻辑时钟 Version
 	event, err := s.appendLocationEvent(ctx, LocationEvent{
 		Kind:   LocationEventUpsert,
-		NodeID: record.nodeID, // [修复]：传入正确的 NodeID 类型
+		NodeID: record.nodeID,
 		Tier:   record.tier,
 		Meta:   record.meta,
 	})
@@ -224,7 +227,7 @@ func (s *ControlPlaneService) AnnounceBlock(ctx context.Context, req *controlpla
 	record.version = event.Version
 
 	return &controlplane.AnnounceBlockResponse{
-		Location:        locationToProto(record, node.Addr), // [修复]：按新签名传入 Addr
+		Location:        locationToProto(record, node.Addr),
 		LocationVersion: event.Version,
 	}, nil
 }
@@ -273,9 +276,7 @@ func (s *ControlPlaneService) GetBlockLocations(ctx context.Context, req *contro
 	records := s.sortedLocations(blockID)
 	locations := make([]*controlplane.BlockLocation, 0, len(records))
 
-	// [修复]：动态获取最新的 Node Addr 组装 Proto。
-	// 物理意义：节点 IP 可能因为重启发生变化，因此元数据中绝对不能硬编码 Addr，
-	// 必须在查询时实时 Join (联表查询) Membership 拓扑获取最新 IP。
+	// 节点地址可能因重启发生变化，查询时从 membership 读取最新地址。
 	for _, record := range records {
 		node, ok := s.membership.Get(record.nodeID)
 		addr := ""
@@ -340,27 +341,32 @@ func blockMetaRecordFromProto(meta *controlplane.BlockMeta) BlockMetaRecord {
 	if meta == nil {
 		return BlockMetaRecord{}
 	}
-	return BlockMetaRecord{
+	record := BlockMetaRecord{
 		BlockID:    meta.GetBlockId(),
 		Length:     meta.GetLength(),
 		Checksum:   meta.GetChecksum(),
 		Generation: meta.GetGeneration(),
 		Seq:        meta.GetSeq(),
 	}
+	copy(record.ObjectID[:], meta.GetObjectId())
+	return record
 }
 
 func blockMetaRecordToProto(meta BlockMetaRecord) *controlplane.BlockMeta {
-	return &controlplane.BlockMeta{
+	result := &controlplane.BlockMeta{
 		BlockId:    meta.BlockID,
 		Length:     meta.Length,
 		Checksum:   meta.Checksum,
 		Generation: meta.Generation,
 		Seq:        meta.Seq,
 	}
+	if meta.ObjectID != ([32]byte{}) {
+		result.ObjectId = append([]byte(nil), meta.ObjectID[:]...)
+	}
+	return result
 }
 
-// [修复]：解耦原记录结构体，将动态 Addr 作为依赖注入参数传入
-// 这是消除脏元数据（如节点 IP 变更导致数据不可达）的关键一步
+// locationToProto 将位置记录和当前节点地址组合成对外响应。
 func locationToProto(record blockLocationRecord, addr string) *controlplane.BlockLocation {
 	return &controlplane.BlockLocation{
 		BlockId: record.meta.BlockID,
