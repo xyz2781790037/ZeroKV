@@ -15,6 +15,7 @@ type RemoteBlock struct {
 	Length   uint64
 	Checksum uint32
 }
+
 type Client struct {
 	// 底层拨号器：负责真实的 TCP 握手和连接建立。
 	Dialer *net.Dialer

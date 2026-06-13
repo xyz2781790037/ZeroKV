@@ -50,8 +50,11 @@ const (
 	// DefaultMaxComputePayloadBytes 限制 compute 请求参数和响应结果的大小。
 	// compute-to-data 的目标是把小计算移动到大数据旁边，而不是通过它传输大结果。
 	DefaultMaxComputePayloadBytes uint64 = 4 << 20
+	DefaultMaxPrefixPayloadBytes  uint64 = 2 << 20
+	DefaultMaxPrefixEntries              = 8192
 
 	tcpComputeRequestHeaderSize = 8
+	tcpPutBlockMetaSize         = 8
 	maxComputeOperatorBytes     = 128
 
 	// maxCopyPayloadBytes 是协议解析器能接受的数学理论上限（int64 最大值）。
@@ -78,6 +81,22 @@ const (
 
 	// tcpMessageComputeResult 代表远端计算结果响应。
 	tcpMessageComputeResult tcpMessageType = 5
+
+	// tcpMessagePutBlock 代表本地 C++ 客户端通过 P2P 降级路径推送 block。
+	tcpMessagePutBlock tcpMessageType = 6
+
+	// tcpMessageAck 代表写入型请求已经提交完成。
+	tcpMessageAck tcpMessageType = 7
+
+	// tcpMessageDeleteBlock 代表本地客户端请求删除当前 daemon 上的 block。
+	tcpMessageDeleteBlock tcpMessageType = 8
+
+	// Prefix lookup is a small control-plane exchange over the existing framed
+	// TCP connection. KV bytes continue to use GetBlock/RDMA.
+	tcpMessageCommitCacheObject  tcpMessageType = 9
+	tcpMessageLookupPrefix       tcpMessageType = 10
+	tcpMessagePrefixLookupResult tcpMessageType = 11
+	tcpMessageReleasePrefixLease tcpMessageType = 12
 )
 
 var (
@@ -89,6 +108,23 @@ var (
 
 type BlockStore interface {
 	OpenBlock(blockID uint64) (io.ReadCloser, uint64, uint64, uint32, bool, error)
+}
+
+type BlockIngestStore interface {
+	IngestBlock(ctx context.Context, seq uint64, blockID uint64, length uint64, checksum uint32, data []byte) error
+}
+
+type BlockDeleteStore interface {
+	DeleteBlock(ctx context.Context, blockID uint64) error
+}
+
+type CacheObjectStore interface {
+	CommitCacheObject(context.Context, CacheObjectCommit) error
+}
+
+type PrefixLookupStore interface {
+	LookupPrefix(context.Context, PrefixLookupRequest) (PrefixLookupResult, error)
+	ReleasePrefixLease(context.Context, uint64) error
 }
 
 const (
@@ -145,6 +181,10 @@ type Server struct {
 	// MaxComputePayloadBytes 是 compute 请求参数和结果的最大字节数。
 	MaxComputePayloadBytes uint64
 
+	// MaxPrefixPayloadBytes bounds semantic lookup metadata independently from
+	// the much larger block data-plane limit.
+	MaxPrefixPayloadBytes uint64
+
 	// ErrorHandler 接收连接处理中无法通过 TCP 协议回传给对端的本地异步 I/O 错误。
 	ErrorHandler func(error)
 }
@@ -158,6 +198,7 @@ func NewServer(addr string, store BlockStore) *Server {
 		PayloadBytesPerSecond:  DefaultPayloadBytesPerSecond,
 		MaxBlockBytes:          DefaultMaxBlockBytes,
 		MaxComputePayloadBytes: DefaultMaxComputePayloadBytes,
+		MaxPrefixPayloadBytes:  DefaultMaxPrefixPayloadBytes,
 	}
 }
 func (s *Server) ListenAndServe(ctx context.Context) error {
@@ -239,6 +280,16 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 		s.handleGetBlock(ctx, conn, header, cancelWatch)
 	case tcpMessageComputeBlock:
 		s.handleComputeBlock(ctx, conn, header)
+	case tcpMessagePutBlock:
+		s.handlePutBlock(ctx, conn, header)
+	case tcpMessageDeleteBlock:
+		s.handleDeleteBlock(ctx, conn, header)
+	case tcpMessageCommitCacheObject:
+		s.handleCommitCacheObject(ctx, conn, header)
+	case tcpMessageLookupPrefix:
+		s.handleLookupPrefix(ctx, conn, header)
+	case tcpMessageReleasePrefixLease:
+		s.handleReleasePrefixLease(ctx, conn, header)
 	default:
 		s.writeError(ctx, conn, header.blockID, fmt.Errorf("network server: unexpected message type %d", header.messageType))
 		return
@@ -355,6 +406,88 @@ func (s *Server) handleComputeBlock(ctx context.Context, conn net.Conn, header t
 	if err := writeFull(conn, result.Payload); err != nil && ctx.Err() == nil {
 		s.reportError(fmt.Errorf("network server: send compute result block %d: %w", header.blockID, err))
 	}
+}
+
+func (s *Server) handlePutBlock(ctx context.Context, conn net.Conn, header tcpFrameHeader) {
+	if s.Store == nil {
+		s.writeError(ctx, conn, header.blockID, fmt.Errorf("network server: nil block store"))
+		return
+	}
+	ingestStore, ok := s.Store.(BlockIngestStore)
+	if !ok {
+		s.writeError(ctx, conn, header.blockID, fmt.Errorf("network server: block ingest is not supported by block store"))
+		return
+	}
+	if header.blockID == 0 {
+		s.writeError(ctx, conn, header.blockID, fmt.Errorf("%w: zero block id", ErrInvalidTCPFrame))
+		return
+	}
+	if header.payloadLen <= tcpPutBlockMetaSize {
+		s.writeError(ctx, conn, header.blockID, fmt.Errorf("%w: put-block payload too short", ErrInvalidTCPFrame))
+		return
+	}
+	dataLen := header.payloadLen - tcpPutBlockMetaSize
+	if err := validateTCPPayloadLength(dataLen, s.MaxBlockBytes); err != nil {
+		s.writeError(ctx, conn, header.blockID, err)
+		return
+	}
+	if dataLen > uint64(maxIntValue()) {
+		s.writeError(ctx, conn, header.blockID, fmt.Errorf("%w: length=%d overflows int allocation limit", ErrBlockTooLarge, dataLen))
+		return
+	}
+
+	_ = setReadDeadline(ctx, conn, s.payloadTimeout(header.payloadLen))
+	var meta [tcpPutBlockMetaSize]byte
+	if _, err := io.ReadFull(conn, meta[:]); err != nil {
+		s.writeError(ctx, conn, header.blockID, err)
+		return
+	}
+	seq := binary.LittleEndian.Uint64(meta[:])
+	if seq == 0 {
+		s.writeError(ctx, conn, header.blockID, fmt.Errorf("%w: zero sequence", ErrInvalidTCPFrame))
+		return
+	}
+	payload := make([]byte, int(dataLen))
+	if _, err := io.ReadFull(conn, payload); err != nil {
+		s.writeError(ctx, conn, header.blockID, err)
+		return
+	}
+	if crc32.ChecksumIEEE(payload) != header.checksum {
+		s.writeError(ctx, conn, header.blockID, ErrChecksumMismatch)
+		return
+	}
+	if err := ingestStore.IngestBlock(ctx, seq, header.blockID, dataLen, header.checksum, payload); err != nil {
+		s.writeError(ctx, conn, header.blockID, err)
+		return
+	}
+
+	s.writeAck(ctx, conn, header.blockID)
+}
+
+func (s *Server) handleDeleteBlock(ctx context.Context, conn net.Conn, header tcpFrameHeader) {
+	if s.Store == nil {
+		s.writeError(ctx, conn, header.blockID, fmt.Errorf("network server: nil block store"))
+		return
+	}
+	deleteStore, ok := s.Store.(BlockDeleteStore)
+	if !ok {
+		s.writeError(ctx, conn, header.blockID, fmt.Errorf("network server: block delete is not supported by block store"))
+		return
+	}
+	if header.blockID == 0 {
+		s.writeError(ctx, conn, header.blockID, fmt.Errorf("%w: zero block id", ErrInvalidTCPFrame))
+		return
+	}
+	if header.payloadLen != 0 || header.checksum != 0 {
+		s.writeError(ctx, conn, header.blockID, fmt.Errorf("%w: delete-block payload must be empty", ErrInvalidTCPFrame))
+		return
+	}
+	if err := deleteStore.DeleteBlock(ctx, header.blockID); err != nil {
+		s.writeError(ctx, conn, header.blockID, err)
+		return
+	}
+
+	s.writeAck(ctx, conn, header.blockID)
 }
 
 func (s *Server) payloadTimeout(payloadLen uint64) time.Duration {
@@ -502,6 +635,13 @@ func validateTCPPayloadLength(payloadLen uint64, maxBytes uint64) error {
 func (s *Server) writeError(ctx context.Context, conn net.Conn, blockID uint64, err error) {
 	_ = setWriteDeadline(ctx, conn, s.headerTimeout())
 	_ = writeTCPError(conn, blockID, err)
+}
+
+func (s *Server) writeAck(ctx context.Context, conn net.Conn, blockID uint64) {
+	_ = setWriteDeadline(ctx, conn, s.headerTimeout())
+	if err := writeTCPHeader(conn, tcpFrameHeader{messageType: tcpMessageAck, blockID: blockID}); err != nil && ctx.Err() == nil {
+		s.reportError(fmt.Errorf("network server: send ack %d: %w", blockID, err))
+	}
 }
 func setReadDeadline(ctx context.Context, conn net.Conn, timeout time.Duration) error {
 	deadline, ok := computeDeadline(ctx, timeout)
