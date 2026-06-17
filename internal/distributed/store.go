@@ -8,10 +8,13 @@ import (
 	"io"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"kvcache/internal/network"
 	"kvcache/internal/storage"
+	"kvcache/internal/transport"
+	"kvcache/pkg/kvcachekey"
 	"kvcache/pkg/logger"
 	"kvcache/pkg/protocol"
 	"kvcache/proto/controlplane"
@@ -20,7 +23,10 @@ import (
 const (
 	defaultAnnounceTimeout = 2 * time.Second
 	defaultFetchTimeout    = 30 * time.Second
+	defaultPrefixLeaseTTL  = 5 * time.Second
 )
+
+var ErrCacheObjectBusy = errors.New("distributed store: cache object is leased or mutating")
 
 // ComputePlacement controls how Store places a compute request when the block
 // is not already local.
@@ -54,17 +60,28 @@ type localBlockAllocator interface {
 	OwnsSharedMemory(string) bool
 }
 
+type blockFetch struct {
+	done chan struct{}
+	err  error
+}
+
+type prefixLease struct {
+	blockIDs  []uint64
+	expiresAt time.Time
+}
+
 // Store composes the local offheap store with the cluster control plane.
 // It is the smallest distributed read-through layer:
-// 1. local UDS writes are first committed locally, then announced to the control plane;
-// 2. local misses query block locations and fetch one remote replica over P2P;
+// 1. local direct writes are first committed locally, then announced to the control plane;
+// 2. local misses query block locations and fetch one remote replica over the configured data plane;
 // 3. fetched blocks are imported into the local offheap pool and announced as a new replica.
 type Store struct {
-	local  *storage.Handler
-	disk   *storage.DiskTier
-	client ControlPlane
-	peers  []ControlPlane
-	p2p    *network.Client
+	local     *storage.Handler
+	disk      *storage.DiskTier
+	client    ControlPlane
+	peers     []ControlPlane
+	p2p       *network.Client
+	dataPlane transport.BlockTransport
 
 	selfID   string
 	selfAddr string
@@ -80,17 +97,29 @@ type Store struct {
 	memoryLowWaterBytes  uint64
 
 	mu       sync.Mutex
-	fetching map[uint64]struct{}
+	fetching map[uint64]*blockFetch
+
+	semantic       *kvcachekey.Index
+	leaseTTL       time.Duration
+	nextLeaseID    atomic.Uint64
+	lookupMu       sync.Mutex
+	lookupPins     map[uint64]uint32
+	lookupMutating map[uint64]struct{}
+	lookupLeases   map[uint64]prefixLease
 }
 
 type StoreOptions struct {
-	SelfID               string
-	SelfAddr             string
-	PeerControls         []ControlPlane
-	DiskTier             *storage.DiskTier
-	AnnounceTimeout      time.Duration
-	FetchTimeout         time.Duration
-	P2PClient            *network.Client
+	SelfID          string
+	SelfAddr        string
+	PeerControls    []ControlPlane
+	DiskTier        *storage.DiskTier
+	AnnounceTimeout time.Duration
+	FetchTimeout    time.Duration
+	PrefixLeaseTTL  time.Duration
+	P2PClient       *network.Client
+	// PrimaryTransport is tried before the existing P2P TCP transport. Cloud
+	// deployments inject RDMA here; nil preserves the current P2P-only behavior.
+	PrimaryTransport     transport.BlockTransport
 	MemoryHighWaterBytes uint64
 	MemoryLowWaterBytes  uint64
 
@@ -112,6 +141,15 @@ func NewStore(local *storage.Handler, client ControlPlane, opts StoreOptions) (*
 	if p2pClient == nil {
 		p2pClient = network.NewClient()
 	}
+	dataPlane := transport.NewFailoverWithHandler(opts.PrimaryTransport, transport.NewP2P(p2pClient),
+		func(primary string, target transport.Target, err error) {
+			logger.Log.Warn("primary block transport failed; using P2P fallback",
+				"component", "distributed_store",
+				"transport", primary,
+				"node_id", target.NodeID,
+				"block_id", target.BlockID,
+				"error", err)
+		})
 	announceTimeout := opts.AnnounceTimeout
 	if announceTimeout <= 0 {
 		announceTimeout = defaultAnnounceTimeout
@@ -120,28 +158,42 @@ func NewStore(local *storage.Handler, client ControlPlane, opts StoreOptions) (*
 	if fetchTimeout <= 0 {
 		fetchTimeout = defaultFetchTimeout
 	}
+	leaseTTL := opts.PrefixLeaseTTL
+	if leaseTTL <= 0 {
+		leaseTTL = defaultPrefixLeaseTTL
+	}
 	memoryHighWaterBytes, memoryLowWaterBytes := normalizeMemoryWatermarks(opts.MemoryHighWaterBytes, opts.MemoryLowWaterBytes)
 	var localLRU *localMemoryLRU
 	if memoryHighWaterBytes > 0 {
 		localLRU = newLocalMemoryLRU()
 	}
-	return &Store{
+	store := &Store{
 		local:                local,
 		disk:                 opts.DiskTier,
 		client:               client,
 		peers:                append([]ControlPlane(nil), opts.PeerControls...),
 		p2p:                  p2pClient,
+		dataPlane:            dataPlane,
 		selfID:               opts.SelfID,
 		selfAddr:             opts.SelfAddr,
 		announceTimeout:      announceTimeout,
 		fetchTimeout:         fetchTimeout,
+		leaseTTL:             leaseTTL,
 		computePlacement:     normalizeComputePlacement(opts.ComputePlacement),
 		remoteComputeAllowed: opts.RemoteComputeAllowed,
 		localLRU:             localLRU,
 		memoryHighWaterBytes: memoryHighWaterBytes,
 		memoryLowWaterBytes:  memoryLowWaterBytes,
-		fetching:             make(map[uint64]struct{}),
-	}, nil
+		fetching:             make(map[uint64]*blockFetch),
+		semantic:             kvcachekey.NewIndex(),
+		lookupPins:           make(map[uint64]uint32),
+		lookupMutating:       make(map[uint64]struct{}),
+		lookupLeases:         make(map[uint64]prefixLease),
+	}
+	if err := store.restoreCacheManifests(); err != nil {
+		return nil, err
+	}
+	return store, nil
 }
 
 func (s *Store) AnnounceDiskBlocks(ctx context.Context) {
@@ -149,7 +201,7 @@ func (s *Store) AnnounceDiskBlocks(ctx context.Context) {
 		return
 	}
 	for _, meta := range s.disk.ListMeta() {
-		if err := s.announceLocalTier(ctx, meta.Seq, meta.ID, meta.Length, meta.Checksum, controlplane.StorageTier_STORAGE_TIER_DISK); err != nil {
+		if err := s.announceLocalTierObject(ctx, meta.Seq, meta.ID, meta.Length, meta.Checksum, s.objectIDForBlock(meta.ID), controlplane.StorageTier_STORAGE_TIER_DISK); err != nil {
 			logger.Log.Warn("failed to announce restored disk block",
 				"component", "distributed_store",
 				"block_id", meta.ID,
@@ -207,6 +259,102 @@ func (s *Store) HandleBlockReady(ctx context.Context, seq uint64, block protocol
 		return err
 	}
 	return s.enforceMemoryWatermark(ctx)
+}
+
+// IngestBlock publishes a payload received by a direct data-plane transport.
+// RDMA uses this as the normal C++ -> daemon path, while P2P can use it as a
+// portable fallback when RDMA hardware or userspace verbs are unavailable.
+func (s *Store) IngestBlock(ctx context.Context, seq uint64, blockID uint64, length uint64, checksum uint32, data []byte) error {
+	if s == nil {
+		return fmt.Errorf("distributed store: nil store")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if blockID == 0 {
+		return fmt.Errorf("distributed store: zero block id")
+	}
+	if seq == 0 {
+		return fmt.Errorf("distributed store: zero sequence")
+	}
+	if length == 0 {
+		return fmt.Errorf("distributed store: zero block length")
+	}
+	if uint64(len(data)) != length {
+		return fmt.Errorf("distributed store: block %d length mismatch: expected=%d got=%d", blockID, length, len(data))
+	}
+	if err := s.ensureMemoryHeadroom(ctx, length); err != nil {
+		return err
+	}
+	block, err := s.local.ImportBlock(blockID, seq, length, checksum, data)
+	if err != nil {
+		return err
+	}
+	s.touchMemory(storage.BlockMeta{
+		ID:        block.ID,
+		Seq:       block.Seq,
+		Length:    block.Length,
+		Allocated: block.Allocated,
+		Checksum:  block.Checksum,
+	})
+	if s.disk != nil {
+		if err := s.mirrorBlockToDisk(ctx, seq, blockID); err != nil {
+			logger.Log.Warn("failed to mirror ingested block to disk tier",
+				"component", "distributed_store",
+				"block_id", blockID,
+				"error", err)
+		}
+	}
+	if err := s.announce(ctx, seq, blockID, length, checksum); err != nil {
+		return err
+	}
+	return s.enforceMemoryWatermark(ctx)
+}
+
+// DeleteBlock removes this daemon's local replica from memory and disk, then
+// clears this node's block locations from the control plane.
+func (s *Store) DeleteBlock(ctx context.Context, blockID uint64) error {
+	if s == nil {
+		return fmt.Errorf("distributed store: nil store")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if blockID == 0 {
+		return fmt.Errorf("distributed store: zero block id")
+	}
+	if !s.beginCacheMutation(blockID) {
+		return ErrCacheObjectBusy
+	}
+	defer s.endCacheMutation(blockID)
+
+	if _, found, err := s.local.DeleteBlock(blockID); err != nil {
+		return err
+	} else if found {
+		s.localLRU.remove(blockID)
+		if err := s.forgetTier(ctx, blockID, controlplane.StorageTier_STORAGE_TIER_MEMORY, "client_delete"); err != nil {
+			logger.Log.Warn("failed to forget deleted memory block",
+				"component", "distributed_store",
+				"block_id", blockID,
+				"error", err)
+		}
+	}
+
+	if s.disk != nil {
+		if s.disk.Has(blockID) {
+			if err := s.disk.Delete(blockID); err != nil {
+				return err
+			}
+			if err := s.forgetTier(ctx, blockID, controlplane.StorageTier_STORAGE_TIER_DISK, "client_delete"); err != nil {
+				logger.Log.Warn("failed to forget deleted disk block",
+					"component", "distributed_store",
+					"block_id", blockID,
+					"error", err)
+			}
+		}
+	}
+	s.semantic.ForgetBlock(blockID)
+	return nil
 }
 
 // OpenBlock serves in tier order: local offheap memory, local disk, then
@@ -391,7 +539,11 @@ func (s *Store) announce(parent context.Context, seq uint64, blockID uint64, len
 }
 
 func (s *Store) announceTier(parent context.Context, seq uint64, blockID uint64, length uint64, checksum uint32, tier controlplane.StorageTier) error {
-	if err := s.announceLocalTier(parent, seq, blockID, length, checksum, tier); err != nil {
+	return s.announceTierObject(parent, seq, blockID, length, checksum, s.objectIDForBlock(blockID), tier)
+}
+
+func (s *Store) announceTierObject(parent context.Context, seq uint64, blockID uint64, length uint64, checksum uint32, objectID []byte, tier controlplane.StorageTier) error {
+	if err := s.announceLocalTierObject(parent, seq, blockID, length, checksum, objectID, tier); err != nil {
 		return err
 	}
 	ctx := parent
@@ -412,6 +564,7 @@ func (s *Store) announceTier(parent context.Context, seq uint64, blockID uint64,
 				Length:   length,
 				Checksum: checksum,
 				Seq:      seq,
+				ObjectId: append([]byte(nil), objectID...),
 			},
 			Tier: tier,
 		})
@@ -426,6 +579,10 @@ func (s *Store) announceTier(parent context.Context, seq uint64, blockID uint64,
 }
 
 func (s *Store) announceLocalTier(parent context.Context, seq uint64, blockID uint64, length uint64, checksum uint32, tier controlplane.StorageTier) error {
+	return s.announceLocalTierObject(parent, seq, blockID, length, checksum, s.objectIDForBlock(blockID), tier)
+}
+
+func (s *Store) announceLocalTierObject(parent context.Context, seq uint64, blockID uint64, length uint64, checksum uint32, objectID []byte, tier controlplane.StorageTier) error {
 	if s.client == nil {
 		return nil
 	}
@@ -443,6 +600,7 @@ func (s *Store) announceLocalTier(parent context.Context, seq uint64, blockID ui
 			Length:   length,
 			Checksum: checksum,
 			Seq:      seq,
+			ObjectId: append([]byte(nil), objectID...),
 		},
 		Tier: tier,
 	})
@@ -629,17 +787,20 @@ func (s *Store) fetchAndCache(blockID uint64) error {
 	return s.fetchAndCacheFromLocations(ctx, blockID, locations)
 }
 
-func (s *Store) fetchAndCacheFromLocations(ctx context.Context, blockID uint64, locations []*controlplane.BlockLocation) error {
+func (s *Store) fetchAndCacheFromLocations(ctx context.Context, blockID uint64, locations []*controlplane.BlockLocation) (err error) {
 	if s == nil {
 		return fmt.Errorf("distributed store: nil store")
 	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if !s.beginFetch(blockID) {
-		return network.ErrBlockNotFound
+	fetch, owner := s.beginFetch(blockID)
+	if !owner {
+		return waitFetch(ctx, fetch)
 	}
-	defer s.endFetch(blockID)
+	defer func() {
+		s.endFetch(blockID, fetch, err)
+	}()
 
 	locations = sortLocations(locations)
 	var lastErr error
@@ -659,7 +820,11 @@ func (s *Store) fetchAndCacheFromLocations(ctx context.Context, blockID uint64, 
 		if err != nil {
 			return err
 		}
-		remote, err := s.p2p.FetchBlockTo(ctx, loc.GetAddr(), blockID, writer)
+		remote, err := s.dataPlane.FetchBlockTo(ctx, transport.Target{
+			NodeID:  loc.GetNodeId(),
+			Address: loc.GetAddr(),
+			BlockID: blockID,
+		}, writer)
 		if err != nil {
 			_ = writer.Rollback()
 			lastErr = err
@@ -784,7 +949,14 @@ func (s *Store) spillColdBlocks(ctx context.Context, incomingBytes uint64) error
 		if _, busy := busyVictims[victim.ID]; busy {
 			break
 		}
+		if !s.beginCacheMutation(victim.ID) {
+			busyVictims[victim.ID] = struct{}{}
+			s.localLRU.touchID(victim.ID)
+			lastErr = ErrCacheObjectBusy
+			continue
+		}
 		meta, found, err := s.local.TrySpillToDisk(victim.ID, s.disk)
+		s.endCacheMutation(victim.ID)
 		switch {
 		case errors.Is(err, storage.ErrBlockBusy):
 			busyVictims[victim.ID] = struct{}{}
@@ -902,20 +1074,38 @@ func (s *Store) getLocations(ctx context.Context, blockID uint64) ([]*controlpla
 	return locations, nil
 }
 
-func (s *Store) beginFetch(blockID uint64) bool {
+func (s *Store) beginFetch(blockID uint64) (*blockFetch, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.fetching[blockID]; ok {
-		return false
+	if fetch, ok := s.fetching[blockID]; ok {
+		return fetch, false
 	}
-	s.fetching[blockID] = struct{}{}
-	return true
+	fetch := &blockFetch{done: make(chan struct{})}
+	s.fetching[blockID] = fetch
+	return fetch, true
 }
 
-func (s *Store) endFetch(blockID uint64) {
+func (s *Store) endFetch(blockID uint64, fetch *blockFetch, err error) {
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	if current := s.fetching[blockID]; current != fetch {
+		return
+	}
+	fetch.err = err
 	delete(s.fetching, blockID)
-	s.mu.Unlock()
+	close(fetch.done)
+}
+
+func waitFetch(ctx context.Context, fetch *blockFetch) error {
+	if fetch == nil {
+		return network.ErrBlockNotFound
+	}
+	select {
+	case <-fetch.done:
+		return fetch.err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (s *Store) skipLocation(loc *controlplane.BlockLocation) bool {
