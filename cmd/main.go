@@ -14,8 +14,8 @@ import (
 
 	"kvcache/internal/coordinator"
 	"kvcache/internal/distributed"
-	"kvcache/internal/ipc"
 	"kvcache/internal/network"
+	"kvcache/internal/rdma"
 	"kvcache/internal/storage"
 	"kvcache/pkg/logger"
 	"kvcache/proto/controlplane"
@@ -32,20 +32,20 @@ func main() {
 }
 
 type config struct {
-	socketPath       string
+	rdmaAddr         string
 	p2pAddr          string
 	controlAddr      string
 	selfID           string
 	selfAddr         string
 	joinControlAddrs []string
 	offheapBytes     uint64
-	shmName          string
-	shmBytes         uint64
 	diskDir          string
 	memoryHighBytes  uint64
 	memoryLowBytes   uint64
+	rdmaMaxConns     int
 	p2pMaxConns      int
 	membershipSync   time.Duration
+	prefixLeaseTTL   time.Duration
 	shutdownPeriod   time.Duration
 }
 
@@ -86,44 +86,41 @@ func (a grpcControlPlaneAdapter) GetBlockLocations(ctx context.Context, req *con
 
 func parseConfig() config {
 	hostname, _ := os.Hostname()
-	socketPath := flag.String("socket", "/tmp/kvcache.sock", "Unix domain socket path for C++ clients")
+	rdmaAddr := flag.String("rdma-addr", ":19100", "RDMA write endpoint for local C++ clients")
 	p2pAddr := flag.String("p2p-addr", ":19090", "TCP address for P2P block transfer")
 	controlAddr := flag.String("control-addr", ":19091", "gRPC address for control plane")
 	selfID := flag.String("node-id", hostname, "local node id")
 	selfAddr := flag.String("node-addr", "", "advertised P2P address; defaults to -p2p-addr")
 	joinControlAddrs := flag.String("join-control-addrs", "", "comma-separated peer gRPC control-plane addresses")
 	offheapBytes := flag.Uint64("offheap-bytes", 1<<30, "offheap memory pool size in bytes")
-	shmName := flag.String("shm-name", "", "daemon-owned POSIX shared memory pool name; empty uses kvcache_daemon_<pid>")
-	shmBytes := flag.Uint64("shm-bytes", 0, "daemon-owned POSIX shared memory pool size in bytes; defaults to -offheap-bytes")
 	diskDir := flag.String("disk-dir", "", "local disk tier directory; empty disables disk tier")
 	memoryHighBytes := flag.Uint64("memory-high-bytes", 0, "local memory tier high watermark; requires -disk-dir")
 	memoryLowBytes := flag.Uint64("memory-low-bytes", 0, "local memory tier low watermark after LRU spill; defaults to 80% of high")
+	rdmaMaxConns := flag.Int("rdma-max-conns", rdma.DefaultMaxConnections, "maximum concurrent RDMA write connections")
 	p2pMaxConns := flag.Int("p2p-max-conns", network.DefaultMaxConnections, "maximum concurrent P2P TCP connections")
 	membershipSync := flag.Duration("membership-sync-interval", 5*time.Second, "interval for syncing membership with joined control planes")
+	prefixLeaseTTL := flag.Duration("prefix-lease-ttl", 5*time.Second, "maximum time a Prefix Lookup batch remains pinned while the connector loads KV blocks")
 	shutdownPeriod := flag.Duration("shutdown-timeout", 10*time.Second, "graceful shutdown timeout")
 	flag.Parse()
 
 	if *selfAddr == "" {
 		*selfAddr = *p2pAddr
 	}
-	if *shmBytes == 0 {
-		*shmBytes = *offheapBytes
-	}
 	return config{
-		socketPath:       *socketPath,
+		rdmaAddr:         *rdmaAddr,
 		p2pAddr:          *p2pAddr,
 		controlAddr:      *controlAddr,
 		selfID:           *selfID,
 		selfAddr:         *selfAddr,
 		joinControlAddrs: parseAddrList(*joinControlAddrs),
 		offheapBytes:     *offheapBytes,
-		shmName:          *shmName,
-		shmBytes:         *shmBytes,
 		diskDir:          *diskDir,
 		memoryHighBytes:  *memoryHighBytes,
 		memoryLowBytes:   *memoryLowBytes,
+		rdmaMaxConns:     *rdmaMaxConns,
 		p2pMaxConns:      *p2pMaxConns,
 		membershipSync:   *membershipSync,
+		prefixLeaseTTL:   *prefixLeaseTTL,
 		shutdownPeriod:   *shutdownPeriod,
 	}
 }
@@ -142,15 +139,8 @@ func run(cfg config) error {
 		return err
 	}
 
-	shmPool, err := storage.NewSharedMemoryPool(cfg.shmName, cfg.shmBytes)
+	handler, err := storage.NewHandler(pool)
 	if err != nil {
-		_ = pool.Release()
-		return err
-	}
-
-	handler, err := storage.NewHandlerWithSharedMemory(pool, shmPool)
-	if err != nil {
-		_ = shmPool.Release()
 		_ = pool.Release()
 		return err
 	}
@@ -201,18 +191,17 @@ func run(cfg config) error {
 		DiskTier:             diskTier,
 		MemoryHighWaterBytes: cfg.memoryHighBytes,
 		MemoryLowWaterBytes:  cfg.memoryLowBytes,
+		PrefixLeaseTTL:       cfg.prefixLeaseTTL,
+		// The daemon is a KV cache service; remote compute remains an explicit
+		// runtime choice until a real executor is attached to the holder node.
+		ComputePlacement: distributed.ComputePlacementFetchLocalOnly,
 	})
 	if err != nil {
 		return err
 	}
 	distributedStore.AnnounceDiskBlocks(ctx)
 
-	udsServer := ipc.NewUDSServer(cfg.socketPath, distributedStore)
-	if err := udsServer.Start(); err != nil {
-		return err
-	}
-
-	errCh := make(chan error, 3)
+	errCh := make(chan error, 4)
 	var wg sync.WaitGroup
 
 	grpcServer := grpc.NewServer()
@@ -220,9 +209,21 @@ func run(cfg config) error {
 	controlListener, err := net.Listen("tcp", cfg.controlAddr)
 	if err != nil {
 		cancelRun()
-		udsServer.Stop()
 		return err
 	}
+
+	rdmaServer := rdma.NewServer(cfg.rdmaAddr, distributedStore)
+	rdmaServer.MaxConnections = cfg.rdmaMaxConns
+	rdmaServer.ErrorHandler = func(err error) {
+		logger.Log.Warn("rdma server error", "error", err)
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := rdmaServer.ListenAndServe(ctx); err != nil {
+			errCh <- fmt.Errorf("rdma server: %w", err)
+		}
+	}()
 
 	p2pServer := network.NewServer(cfg.p2pAddr, distributedStore)
 	p2pServer.MaxConnections = cfg.p2pMaxConns
@@ -254,15 +255,14 @@ func run(cfg config) error {
 	logger.Log.Info("kv cache daemon is ready",
 		"node_id", cfg.selfID,
 		"node_addr", cfg.selfAddr,
-		"socket_path", cfg.socketPath,
+		"rdma_addr", cfg.rdmaAddr,
 		"p2p_addr", cfg.p2pAddr,
 		"control_addr", cfg.controlAddr,
 		"join_control_addrs", cfg.joinControlAddrs,
 		"offheap_bytes", cfg.offheapBytes,
-		"shm_name", shmPool.Name(),
-		"shm_bytes", cfg.shmBytes,
 		"disk_dir", cfg.diskDir,
 		"memory_high_bytes", cfg.memoryHighBytes,
+		"prefix_lease_ttl", cfg.prefixLeaseTTL,
 		"memory_low_bytes", cfg.memoryLowBytes)
 
 	var runErr error
@@ -279,7 +279,6 @@ func run(cfg config) error {
 	defer cancel()
 	stopSignals()
 
-	udsServer.Stop()
 	gracefulStopGRPC(shutdownCtx, grpcServer)
 	wg.Wait()
 
