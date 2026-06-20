@@ -3,9 +3,8 @@ cmake_minimum_required(VERSION 3.16)
 project(kvcache_cpp LANGUAGES CXX)
 
 add_library(kvcache_client STATIC
+    cache_key.cc
     connector.cc
-    shm_allocator.cc
-    uds_client.cc
 )
 
 target_compile_features(kvcache_client PUBLIC cxx_std_17)
@@ -20,7 +19,6 @@ endif()
 
 add_executable(kvcache_cli
     client/kvcache_client.cc
-    client/text_kv_cpu_api.cc
 )
 
 set_target_properties(kvcache_cli PROPERTIES OUTPUT_NAME kvcache_client)
@@ -40,4 +38,14 @@ if(READLINE_INCLUDE_DIR AND READLINE_LIBRARY)
     endif()
 else()
     message(STATUS "readline not found; kvcache_client will use std::getline")
+endif()
+
+include(CTest)
+if(BUILD_TESTING)
+    add_executable(cache_key_test
+        tests/cache_key_test.cc
+    )
+    target_compile_features(cache_key_test PRIVATE cxx_std_17)
+    target_link_libraries(cache_key_test PRIVATE kvcache_client)
+    add_test(NAME cache_key_test COMMAND cache_key_test)
 endif()
